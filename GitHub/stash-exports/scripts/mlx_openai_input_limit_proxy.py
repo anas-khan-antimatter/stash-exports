@@ -29,10 +29,13 @@ Environment:
 
 from __future__ import annotations
 
+import hashlib
 import http.client
 import json
 import os
 import sys
+import threading
+import time
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from typing import Any, Dict, Optional, Tuple
 from urllib.parse import unquote, urlparse
@@ -346,6 +349,44 @@ def _error_payload(msg: str, code: str = "context_length_exceeded") -> bytes:
     return json.dumps(err).encode("utf-8")
 
 
+_DEDUP_TTL = float(os.environ.get("MLX_DEDUP_TTL", "10"))
+
+
+class _ResponseCache:
+    """Prevents client retry storms by caching recent responses by request hash."""
+
+    def __init__(self) -> None:
+        self._lock = threading.Lock()
+        self._cache: Dict[str, Tuple[float, int, Dict[str, str], bytes]] = {}
+
+    def _key(self, body: bytes) -> str:
+        return hashlib.sha256(body).hexdigest()[:32]
+
+    def get(self, body: bytes) -> Optional[Tuple[int, Dict[str, str], bytes]]:
+        if _DEDUP_TTL <= 0:
+            return None
+        key = self._key(body)
+        with self._lock:
+            entry = self._cache.get(key)
+            if entry and (time.monotonic() - entry[0]) < _DEDUP_TTL:
+                return entry[1], entry[2], entry[3]
+            return None
+
+    def put(self, body: bytes, status: int, headers: Dict[str, str], resp_body: bytes) -> None:
+        if _DEDUP_TTL <= 0:
+            return
+        key = self._key(body)
+        with self._lock:
+            self._cache[key] = (time.monotonic(), status, headers, resp_body)
+            cutoff = time.monotonic() - _DEDUP_TTL * 3
+            stale = [k for k, v in self._cache.items() if v[0] < cutoff]
+            for k in stale:
+                del self._cache[k]
+
+
+_response_cache = _ResponseCache()
+
+
 class ProxyHandler(BaseHTTPRequestHandler):
     tokenizer = None
     template_kw: Dict[str, Any] = {}
@@ -436,6 +477,23 @@ class ProxyHandler(BaseHTTPRequestHandler):
                     pass
                 return
 
+        if (not is_stream and body is not None
+                and backend_path in ("/v1/chat/completions", "/v1/completions", "/chat/completions")):
+            cached = _response_cache.get(body)
+            if cached is not None:
+                c_status, c_headers, c_body = cached
+                self.log_message("dedup: returning cached response (%d bytes, ttl=%ss)", len(c_body), _DEDUP_TTL)
+                self.send_response(c_status)
+                for hk, hv in c_headers.items():
+                    self.send_header(hk, hv)
+                self.send_header("Content-Length", str(len(c_body)))
+                self.end_headers()
+                try:
+                    self.wfile.write(c_body)
+                except (BrokenPipeError, ConnectionResetError):
+                    pass
+                return
+
         out_headers: Dict[str, str] = {}
         skip = {"host", "connection", "proxy-connection", "content-length", "transfer-encoding"}
         for k, v in self.headers.items():
@@ -498,10 +556,15 @@ class ProxyHandler(BaseHTTPRequestHandler):
                 raw_body = resp.read()
                 resp.close()
                 cleaned = _postprocess_nonstreaming(raw_body, self.log_message)
-                self.send_response(resp.status)
+                resp_headers: Dict[str, str] = {}
                 for hk, hv in resp.getheaders():
                     if hk.lower() in ("transfer-encoding", "connection", "content-length"):
                         continue
+                    resp_headers[hk] = hv
+                if body is not None:
+                    _response_cache.put(body, resp.status, resp_headers, cleaned)
+                self.send_response(resp.status)
+                for hk, hv in resp_headers.items():
                     self.send_header(hk, hv)
                 self.send_header("Content-Length", str(len(cleaned)))
                 self.end_headers()
