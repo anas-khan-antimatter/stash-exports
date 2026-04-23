@@ -333,6 +333,15 @@ def _postprocess_nonstreaming(body: bytes, log) -> bytes:
                         "post-process: truncated %s from %d to %d chars (degeneration detected)",
                         field, len(val), len(truncated),
                     )
+        # Some backends put almost everything in `reasoning`. Continue expects
+        # `message.content` to be present to render anything.
+        content = msg.get("content")
+        reasoning = msg.get("reasoning")
+        if (not content or (isinstance(content, str) and not content.strip())) and isinstance(reasoning, str) and reasoning.strip():
+            msg["content"] = _truncate_at_degeneration(reasoning)
+            msg["reasoning"] = ""
+            choice["finish_reason"] = "stop"
+            changed = True
     if changed:
         return json.dumps(data, ensure_ascii=False).encode("utf-8")
     return body
@@ -484,6 +493,9 @@ class ProxyHandler(BaseHTTPRequestHandler):
                 c_status, c_headers, c_body = cached
                 self.log_message("dedup: returning cached response (%d bytes, ttl=%ss)", len(c_body), _DEDUP_TTL)
                 self.send_response(c_status)
+                # Continue expects JSON for /v1/chat/completions. Ensure Content-Type.
+                if not any(k.lower() == "content-type" for k in c_headers):
+                    self.send_header("Content-Type", "application/json")
                 for hk, hv in c_headers.items():
                     self.send_header(hk, hv)
                 self.send_header("Content-Length", str(len(c_body)))
@@ -561,6 +573,8 @@ class ProxyHandler(BaseHTTPRequestHandler):
                     if hk.lower() in ("transfer-encoding", "connection", "content-length"):
                         continue
                     resp_headers[hk] = hv
+                if not any(k.lower() == "content-type" for k in resp_headers):
+                    resp_headers["Content-Type"] = "application/json"
                 if body is not None:
                     _response_cache.put(body, resp.status, resp_headers, cleaned)
                 self.send_response(resp.status)
