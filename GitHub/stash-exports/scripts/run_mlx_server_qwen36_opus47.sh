@@ -57,6 +57,7 @@ done
 sleep 1
 
 echo "Starting mlx_lm backend on :$BACKEND_PORT (model=$MODEL_PATH, prefill-step-size=$PREFILL, prompt-cache-bytes=$CACHE_BYTES)" >&2
+CHAT_TEMPLATE_ARGS="${MLX_CHAT_TEMPLATE_ARGS:-{\"enable_thinking\": false}}"
 python -m mlx_lm server \
   --model "$MODEL_PATH" \
   --host 127.0.0.1 \
@@ -66,6 +67,7 @@ python -m mlx_lm server \
   --prompt-cache-size 2 \
   --prompt-cache-bytes "$CACHE_BYTES" \
   --prefill-step-size "$PREFILL" \
+  --chat-template-args "$CHAT_TEMPLATE_ARGS" \
   "$@" &
 BACKEND_PID=$!
 
@@ -105,6 +107,10 @@ export MLX_MODEL_ID="${MLX_MODEL_ID:-lordx64/Qwen3.6-35B-A3B-Claude-4.7-Opus-Rea
 # Proxy rewrites Cursor "display name" model fields to this value, so mlx_lm's
 # strict model-id check accepts the request. Matches whatever --model is serving.
 export MLX_CHAT_MODEL_ID="${MLX_CHAT_MODEL_ID:-$MODEL_PATH}"
+# Disable extended thinking — 5-bit quantization causes degenerate loops inside
+# <think> blocks.  The model still reasons internally; it just won't emit a
+# separate reasoning trace that spirals into word-salad.
+export MLX_CHAT_TEMPLATE_ARGS="${MLX_CHAT_TEMPLATE_ARGS:-{\"enable_thinking\": false}}"
 
 echo "Starting input-limit proxy on :$LISTEN_PORT → :$BACKEND_PORT (MLX_MAX_INPUT_TOKENS=$MAX_IN)" >&2
 

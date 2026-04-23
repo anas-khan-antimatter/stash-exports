@@ -104,13 +104,108 @@ def _count_completion_tokens(tokenizer, body: Dict[str, Any]) -> int:
     return len(tokenizer.encode(prompt))
 
 
-def _pump_backend_to_client(handler, resp: http.client.HTTPResponse) -> None:
-    """Stream body from mlx_lm to the IDE. Catch disconnects (compact chat, cancel, tab switch)."""
+import re as _re
+
+_LOOP_WINDOW = int(os.environ.get("MLX_LOOP_WINDOW", "200"))
+_LOOP_NGRAM = int(os.environ.get("MLX_LOOP_NGRAM", "8"))
+_LOOP_THRESHOLD = int(os.environ.get("MLX_LOOP_THRESHOLD", "4"))
+
+
+def _detect_degenerate_loop(text: str) -> bool:
+    """
+    Detect degenerate generation via:
+      1. N-gram repetition: any 8-gram repeated 4+ times in the last 200 words.
+      2. Word-salad / synonym chain: if the last 60 words contain no sentence
+         boundary (period, question mark, exclamation, newline) the model is
+         likely in free-association runaway.
+      3. Single-word stutter: any word repeated 6+ times in the last 40 words.
+    """
+    words = text.split()
+    tail = words[-_LOOP_WINDOW:] if len(words) > _LOOP_WINDOW else words
+    if len(tail) < 30:
+        return False
+
+    # Check 1: N-gram repetition
+    if len(tail) >= _LOOP_NGRAM * _LOOP_THRESHOLD:
+        ngrams: Dict[str, int] = {}
+        for i in range(len(tail) - _LOOP_NGRAM + 1):
+            key = " ".join(tail[i : i + _LOOP_NGRAM])
+            ngrams[key] = ngrams.get(key, 0) + 1
+            if ngrams[key] >= _LOOP_THRESHOLD:
+                return True
+
+    # Check 2: no sentence-ending punctuation in last 80 words = word salad
+    check2_len = min(80, len(tail))
+    if check2_len >= 60:
+        recent_text = " ".join(tail[-check2_len:])
+        if not _re.search(r'[.!?\n]', recent_text):
+            return True
+
+    # Check 3: single word repeated 6+ times in last 40 words
+    short_tail = tail[-40:]
+    word_counts: Dict[str, int] = {}
+    for w in short_tail:
+        wl = w.lower().strip(".,!?;:-\"'")
+        if len(wl) < 2:
+            continue
+        word_counts[wl] = word_counts.get(wl, 0) + 1
+        if word_counts[wl] >= 6:
+            return True
+
+    # Check 4: any "word" over 80 chars is a merged/hyphenated degenerate chain
+    for w in tail[-20:]:
+        if len(w) > 80:
+            return True
+
+    # Check 5: high average word length signals word-concatenation degeneration
+    recent = tail[-30:] if len(tail) >= 30 else tail
+    if len(recent) >= 20:
+        avg_len = sum(len(w) for w in recent) / len(recent)
+        long_count = sum(1 for w in recent if len(w) > 15)
+        if avg_len > 12 or long_count > len(recent) * 0.3:
+            return True
+
+    return False
+
+
+def _pump_backend_to_client(handler, resp: http.client.HTTPResponse, is_stream: bool = False) -> None:
+    """
+    Stream body from mlx_lm to the IDE with loop detection.
+    For SSE streams, accumulates token text and kills the response early
+    if degenerate repetition is detected.
+    """
+    accumulated_text = ""
+    check_every = 40
+    token_count = 0
     try:
         while True:
             chunk = resp.read(65536)
             if not chunk:
                 break
+            if is_stream:
+                for line in chunk.decode("utf-8", "replace").split("\n"):
+                    stripped = line.strip()
+                    if stripped.startswith("data: ") and stripped != "data: [DONE]":
+                        try:
+                            evt = json.loads(stripped[6:])
+                            delta = evt.get("choices", [{}])[0].get("delta", {})
+                            content = delta.get("content", "") or delta.get("reasoning", "")
+                            if content:
+                                accumulated_text += content
+                                token_count += 1
+                        except (json.JSONDecodeError, IndexError, KeyError):
+                            pass
+                if token_count > 0 and token_count % check_every == 0:
+                    if _detect_degenerate_loop(accumulated_text):
+                        handler.log_message(
+                            "loop detector: degenerate repetition after ~%d tokens, terminating stream",
+                            token_count,
+                        )
+                        try:
+                            handler.wfile.write(b"data: [DONE]\n\n")
+                        except (BrokenPipeError, ConnectionResetError):
+                            pass
+                        return
             try:
                 handler.wfile.write(chunk)
             except (BrokenPipeError, ConnectionResetError):
@@ -125,20 +220,32 @@ def _pump_backend_to_client(handler, resp: http.client.HTTPResponse) -> None:
             pass
 
 
+_MLX_MAX_COMPLETION_TOKENS = int(os.environ.get("MLX_MAX_COMPLETION_TOKENS", "2048"))
+_MLX_REP_PENALTY = float(os.environ.get("MLX_REPETITION_PENALTY", "2.0"))
+_MLX_REP_CONTEXT = int(os.environ.get("MLX_REPETITION_CONTEXT_SIZE", "1024"))
+
+
+def _inject_generation_defaults(data: dict) -> None:
+    """
+    Reasoning-distilled models loop inside <think> blocks without strong
+    repetition penalties and token caps.  Inject aggressive defaults.
+    """
+    if data.get("repetition_penalty", 0) == 0 and data.get("frequency_penalty", 0) == 0:
+        data.setdefault("repetition_penalty", _MLX_REP_PENALTY)
+        data.setdefault("repetition_context_size", _MLX_REP_CONTEXT)
+    if _MLX_MAX_COMPLETION_TOKENS > 0:
+        cur = data.get("max_tokens") or data.get("max_completion_tokens") or 999999
+        cap = min(int(cur), _MLX_MAX_COMPLETION_TOKENS)
+        data["max_tokens"] = cap
+
+
 def _rewrite_openai_model_field(body: bytes, backend_path: str, log) -> bytes:
     """
     Cursor custom models often use a display name as `model`, but mlx_lm expects a
     valid Hugging Face repo id for the loaded weights.
+    Also injects repetition_penalty defaults on chat/completion endpoints.
     """
-    if os.environ.get("MLX_CHAT_MODEL_REWRITE", "1") == "0":
-        return body
     if backend_path not in ("/v1/chat/completions", "/v1/completions", "/chat/completions"):
-        return body
-    target = os.environ.get(
-        "MLX_CHAT_MODEL_ID",
-        "lordx64/Qwen3.6-35B-A3B-Claude-4.7-Opus-Reasoning-Distilled",
-    ).strip()
-    if not target:
         return body
     try:
         data = json.loads(body.decode("utf-8"))
@@ -146,20 +253,86 @@ def _rewrite_openai_model_field(body: bytes, backend_path: str, log) -> bytes:
         return body
     if not isinstance(data, dict):
         return body
-    old = data.get("model", "")
-    if not isinstance(old, str):
-        return body
-    if old == target:
-        return body
-    # mlx_lm is started with one specific model id / path; anything else in the
-    # client payload is a display name, stale id, or a mismatched HF repo — mlx
-    # would reject it. Always normalize to the configured target.
-    data["model"] = target
-    if data.get("repetition_penalty", 0) == 0 and data.get("frequency_penalty", 0) == 0:
-        data.setdefault("repetition_penalty", 1.15)
-        data.setdefault("repetition_context_size", 256)
-    log("rewrote JSON model field %r -> %r", old, target)
+
+    changed = False
+
+    _inject_generation_defaults(data)
+
+    if os.environ.get("MLX_CHAT_MODEL_REWRITE", "1") != "0":
+        target = os.environ.get(
+            "MLX_CHAT_MODEL_ID",
+            "lordx64/Qwen3.6-35B-A3B-Claude-4.7-Opus-Reasoning-Distilled",
+        ).strip()
+        old = data.get("model", "")
+        if target and isinstance(old, str) and old != target:
+            data["model"] = target
+            log("rewrote JSON model field %r -> %r", old, target)
+            changed = True
+
     return json.dumps(data, ensure_ascii=False).encode("utf-8")
+
+
+_MIN_KEEP_CHARS = 200
+
+
+def _truncate_at_degeneration(text: str) -> str:
+    """
+    Walk through the text in overlapping windows.  At the first window that
+    triggers the loop detector, truncate back to the last sentence boundary
+    before it.  Always keep at least _MIN_KEEP_CHARS of text.
+    """
+    words = text.split()
+    if len(words) < 120:
+        return text
+    window = 120
+    for end in range(window, len(words), 10):
+        segment = " ".join(words[max(0, end - window) : end])
+        if _detect_degenerate_loop(segment):
+            cut_point = max(0, end - window)
+            good_text = " ".join(words[:cut_point])
+            if len(good_text) < _MIN_KEEP_CHARS:
+                good_text = text[:_MIN_KEEP_CHARS]
+            last_sentence = max(
+                good_text.rfind(". "),
+                good_text.rfind(".\n"),
+                good_text.rfind("? "),
+                good_text.rfind("! "),
+            )
+            if last_sentence > _MIN_KEEP_CHARS // 2:
+                return good_text[: last_sentence + 1]
+            return good_text
+    return text
+
+
+def _postprocess_nonstreaming(body: bytes, log) -> bytes:
+    """
+    For non-streaming chat/completion responses, detect and truncate degenerate
+    content/reasoning fields before sending to the client.
+    """
+    try:
+        data = json.loads(body.decode("utf-8"))
+    except (json.JSONDecodeError, UnicodeDecodeError):
+        return body
+    if not isinstance(data, dict):
+        return body
+    changed = False
+    for choice in data.get("choices", []):
+        msg = choice.get("message", {})
+        for field in ("content", "reasoning"):
+            val = msg.get(field)
+            if val and isinstance(val, str) and len(val) > 200:
+                truncated = _truncate_at_degeneration(val)
+                if len(truncated) < len(val):
+                    msg[field] = truncated
+                    choice["finish_reason"] = "stop"
+                    changed = True
+                    log(
+                        "post-process: truncated %s from %d to %d chars (degeneration detected)",
+                        field, len(val), len(truncated),
+                    )
+    if changed:
+        return json.dumps(data, ensure_ascii=False).encode("utf-8")
+    return body
 
 
 def _error_payload(msg: str, code: str = "context_length_exceeded") -> bytes:
@@ -223,6 +396,7 @@ class ProxyHandler(BaseHTTPRequestHandler):
         backend_port = int(os.environ.get("MLX_BACKEND_PORT", "18080"))
         backend_path = _normalize_request_path(self.path)
 
+        is_stream = False
         body: Optional[bytes] = None
         if self.command in ("POST", "PUT", "PATCH"):
             length = self.headers.get("Content-Length")
@@ -242,6 +416,11 @@ class ProxyHandler(BaseHTTPRequestHandler):
             else:
                 body = b""
             body = _rewrite_openai_model_field(body, backend_path, self.log_message)
+            try:
+                req_data = json.loads(body.decode("utf-8"))
+                is_stream = bool(req_data.get("stream", False))
+            except (json.JSONDecodeError, UnicodeDecodeError):
+                pass
 
         if body is not None and self._should_check(backend_path):
             ok, err_body = self._check_body(backend_path, body)
@@ -315,14 +494,29 @@ class ProxyHandler(BaseHTTPRequestHandler):
                 except (BrokenPipeError, ConnectionResetError):
                     pass
                 return
-            self.send_response(resp.status)
-            for hk, hv in resp.getheaders():
-                # Hop-by-hop headers
-                if hk.lower() in ("transfer-encoding", "connection"):
-                    continue
-                self.send_header(hk, hv)
-            self.end_headers()
-            _pump_backend_to_client(self, resp)
+            if not is_stream and backend_path in ("/v1/chat/completions", "/v1/completions", "/chat/completions"):
+                raw_body = resp.read()
+                resp.close()
+                cleaned = _postprocess_nonstreaming(raw_body, self.log_message)
+                self.send_response(resp.status)
+                for hk, hv in resp.getheaders():
+                    if hk.lower() in ("transfer-encoding", "connection", "content-length"):
+                        continue
+                    self.send_header(hk, hv)
+                self.send_header("Content-Length", str(len(cleaned)))
+                self.end_headers()
+                try:
+                    self.wfile.write(cleaned)
+                except (BrokenPipeError, ConnectionResetError):
+                    pass
+            else:
+                self.send_response(resp.status)
+                for hk, hv in resp.getheaders():
+                    if hk.lower() in ("transfer-encoding", "connection"):
+                        continue
+                    self.send_header(hk, hv)
+                self.end_headers()
+                _pump_backend_to_client(self, resp, is_stream=is_stream)
         finally:
             conn.close()
 
@@ -345,6 +539,12 @@ def main() -> None:
     max_t = os.environ.get("MLX_MAX_INPUT_TOKENS", "32768")
     sys.stderr.write(
         f"mlx_openai_input_limit_proxy: tokenizer ok, MLX_MAX_INPUT_TOKENS={max_t}\n"
+    )
+    sys.stderr.write(
+        f"  anti-loop: repetition_penalty={_MLX_REP_PENALTY}, "
+        f"context_size={_MLX_REP_CONTEXT}, "
+        f"max_completion_tokens={_MLX_MAX_COMPLETION_TOKENS}, "
+        f"loop_detect=window:{_LOOP_WINDOW}/ngram:{_LOOP_NGRAM}/threshold:{_LOOP_THRESHOLD}\n"
     )
     sys.stderr.write(
         f"Forwarding to http://{os.environ.get('MLX_BACKEND_HOST', '127.0.0.1')}:"
