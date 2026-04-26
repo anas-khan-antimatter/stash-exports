@@ -261,6 +261,18 @@ def _rewrite_openai_model_field(body: bytes, backend_path: str, log) -> bytes:
 
     _inject_generation_defaults(data)
 
+    # Continue can send tool definitions and expect structured tool-call JSON in
+    # the response. This particular model frequently emits tool-like markup as
+    # plain text (e.g. "tool ... BEGIN ARG ...") which causes Continue to try
+    # JSON-parsing and fail. Default to stripping tool-calling fields.
+    if os.environ.get("MLX_STRIP_TOOLS", "1") != "0":
+        if "tools" in data:
+            data.pop("tools", None)
+            changed = True
+        if "tool_choice" in data:
+            data.pop("tool_choice", None)
+            changed = True
+
     if os.environ.get("MLX_CHAT_MODEL_REWRITE", "1") != "0":
         target = os.environ.get(
             "MLX_CHAT_MODEL_ID",
