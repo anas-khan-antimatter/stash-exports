@@ -223,6 +223,39 @@ def _pump_backend_to_client(handler, resp: http.client.HTTPResponse, is_stream: 
             pass
 
 
+def _emit_sse_from_json(handler, cleaned: bytes) -> None:
+    """
+    Continue may request stream=true and expects SSE. If we call the backend with
+    stream=false (to enable post-processing), convert the JSON response back
+    into a minimal SSE stream.
+    """
+    try:
+        d = json.loads(cleaned.decode("utf-8"))
+        msg = d.get("choices", [{}])[0].get("message", {}) or {}
+        content = msg.get("content") or ""
+    except Exception:
+        content = ""
+    handler.send_response(200)
+    handler.send_header("Content-Type", "text/event-stream")
+    handler.send_header("Cache-Control", "no-cache")
+    handler.send_header("Connection", "keep-alive")
+    handler.end_headers()
+
+    def send_delta(text: str) -> None:
+        payload = {"choices": [{"delta": {"content": text}}]}
+        line = ("data: " + json.dumps(payload, ensure_ascii=False) + "\n\n").encode("utf-8")
+        handler.wfile.write(line)
+
+    try:
+        if content:
+            # chunk to keep frames small
+            for i in range(0, len(content), 400):
+                send_delta(content[i : i + 400])
+        handler.wfile.write(b"data: [DONE]\n\n")
+    except (BrokenPipeError, ConnectionResetError):
+        pass
+
+
 _MLX_MAX_COMPLETION_TOKENS = int(os.environ.get("MLX_MAX_COMPLETION_TOKENS", "512"))
 _MLX_REP_PENALTY = float(os.environ.get("MLX_REPETITION_PENALTY", "2.0"))
 _MLX_REP_CONTEXT = int(os.environ.get("MLX_REPETITION_CONTEXT_SIZE", "1024"))
@@ -242,6 +275,10 @@ def _inject_generation_defaults(data: dict) -> None:
     if data.get("repetition_penalty", 0) == 0 and data.get("frequency_penalty", 0) == 0:
         data.setdefault("repetition_penalty", _MLX_REP_PENALTY)
         data.setdefault("repetition_context_size", _MLX_REP_CONTEXT)
+    # Stop sequences to prevent tool-markup / XML-ish leakage that breaks Continue.
+    stop = data.get("stop")
+    if not stop:
+        data["stop"] = ["```tool", "tool-", "BEGIN_ARG", "<invoke", "</invoke>", "<tool", "</tool>"]
     if _MLX_MAX_COMPLETION_TOKENS > 0:
         cur = data.get("max_tokens") or data.get("max_completion_tokens") or 999999
         cap = min(int(cur), _MLX_MAX_COMPLETION_TOKENS)
@@ -489,7 +526,7 @@ class ProxyHandler(BaseHTTPRequestHandler):
         backend_port = int(os.environ.get("MLX_BACKEND_PORT", "18080"))
         backend_path = _normalize_request_path(self.path)
 
-        is_stream = False
+        client_stream = False
         body: Optional[bytes] = None
         if self.command in ("POST", "PUT", "PATCH"):
             length = self.headers.get("Content-Length")
@@ -508,12 +545,24 @@ class ProxyHandler(BaseHTTPRequestHandler):
                 body = b"".join(chunks)
             else:
                 body = b""
-            body = _rewrite_openai_model_field(body, backend_path, self.log_message)
+            # Detect whether the client wants streaming BEFORE rewriting.
             try:
-                req_data = json.loads(body.decode("utf-8"))
-                is_stream = bool(req_data.get("stream", False))
+                raw_req = json.loads(body.decode("utf-8"))
+                client_stream = bool(raw_req.get("stream", False))
             except (json.JSONDecodeError, UnicodeDecodeError):
-                pass
+                client_stream = False
+            body = _rewrite_openai_model_field(body, backend_path, self.log_message)
+            # If the client requested SSE, force backend non-streaming so we can
+            # truncate/clean the full response and then re-emit SSE ourselves.
+            if client_stream:
+                try:
+                    req_data = json.loads(body.decode("utf-8"))
+                    if isinstance(req_data, dict):
+                        req_data["stream"] = False
+                        req_data.pop("stream_options", None)
+                        body = json.dumps(req_data, ensure_ascii=False).encode("utf-8")
+                except (json.JSONDecodeError, UnicodeDecodeError):
+                    pass
 
         if body is not None and self._should_check(backend_path):
             ok, err_body = self._check_body(backend_path, body)
@@ -529,7 +578,7 @@ class ProxyHandler(BaseHTTPRequestHandler):
                     pass
                 return
 
-        if (not is_stream and body is not None
+        if (not client_stream and body is not None
                 and backend_path in ("/v1/chat/completions", "/v1/completions", "/chat/completions")):
             cached = _response_cache.get(body)
             if cached is not None:
@@ -607,10 +656,13 @@ class ProxyHandler(BaseHTTPRequestHandler):
                 except (BrokenPipeError, ConnectionResetError):
                     pass
                 return
-            if not is_stream and backend_path in ("/v1/chat/completions", "/v1/completions", "/chat/completions"):
+            if backend_path in ("/v1/chat/completions", "/v1/completions", "/chat/completions"):
                 raw_body = resp.read()
                 resp.close()
                 cleaned = _postprocess_nonstreaming(raw_body, self.log_message)
+                if client_stream and backend_path in ("/v1/chat/completions", "/chat/completions"):
+                    _emit_sse_from_json(self, cleaned)
+                    return
                 resp_headers: Dict[str, str] = {}
                 for hk, hv in resp.getheaders():
                     if hk.lower() in ("transfer-encoding", "connection", "content-length"):
@@ -636,7 +688,7 @@ class ProxyHandler(BaseHTTPRequestHandler):
                         continue
                     self.send_header(hk, hv)
                 self.end_headers()
-                _pump_backend_to_client(self, resp, is_stream=is_stream)
+                _pump_backend_to_client(self, resp, is_stream=client_stream)
         finally:
             conn.close()
 
