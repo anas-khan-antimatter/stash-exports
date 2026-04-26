@@ -226,7 +226,7 @@ def _pump_backend_to_client(handler, resp: http.client.HTTPResponse, is_stream: 
 _MLX_MAX_COMPLETION_TOKENS = int(os.environ.get("MLX_MAX_COMPLETION_TOKENS", "512"))
 _MLX_REP_PENALTY = float(os.environ.get("MLX_REPETITION_PENALTY", "2.0"))
 _MLX_REP_CONTEXT = int(os.environ.get("MLX_REPETITION_CONTEXT_SIZE", "1024"))
-_MLX_FORCE_NONSTREAM = os.environ.get("MLX_FORCE_NONSTREAM", "1") != "0"
+_MLX_FORCE_NONSTREAM = os.environ.get("MLX_FORCE_NONSTREAM", "0") != "0"
 
 
 def _inject_generation_defaults(data: dict) -> None:
@@ -242,8 +242,7 @@ def _inject_generation_defaults(data: dict) -> None:
         cap = min(int(cur), _MLX_MAX_COMPLETION_TOKENS)
         data["max_tokens"] = cap
     if _MLX_FORCE_NONSTREAM:
-        # Continue often uses streaming; force non-streaming so we can reliably
-        # post-process and truncate degenerate outputs before they reach the client.
+        # Only force non-streaming when explicitly requested.
         data["stream"] = False
         data.pop("stream_options", None)
 
