@@ -227,6 +227,11 @@ _MLX_MAX_COMPLETION_TOKENS = int(os.environ.get("MLX_MAX_COMPLETION_TOKENS", "51
 _MLX_REP_PENALTY = float(os.environ.get("MLX_REPETITION_PENALTY", "2.0"))
 _MLX_REP_CONTEXT = int(os.environ.get("MLX_REPETITION_CONTEXT_SIZE", "1024"))
 _MLX_FORCE_NONSTREAM = os.environ.get("MLX_FORCE_NONSTREAM", "0") != "0"
+_MLX_SYSTEM_PREFIX = os.environ.get(
+    "MLX_SYSTEM_PREFIX",
+    "Do not output tool-call markup. Do not write lines starting with `tool` or fenced blocks like ```tool. "
+    "Answer normally in plain text.",
+).strip()
 
 
 def _inject_generation_defaults(data: dict) -> None:
@@ -265,6 +270,20 @@ def _rewrite_openai_model_field(body: bytes, backend_path: str, log) -> bytes:
     changed = False
 
     _inject_generation_defaults(data)
+
+    # Inject a tiny guardrail system instruction to stop the model from emitting
+    # tool-call markup as plain text (Continue may treat it as a tool call).
+    if _MLX_SYSTEM_PREFIX and backend_path in ("/v1/chat/completions", "/chat/completions"):
+        msgs = data.get("messages")
+        if isinstance(msgs, list) and msgs:
+            first = msgs[0]
+            if isinstance(first, dict) and first.get("role") == "system" and isinstance(first.get("content"), str):
+                if _MLX_SYSTEM_PREFIX not in first["content"]:
+                    first["content"] = _MLX_SYSTEM_PREFIX + "\n\n" + first["content"]
+                    changed = True
+            else:
+                msgs.insert(0, {"role": "system", "content": _MLX_SYSTEM_PREFIX})
+                changed = True
 
     # Continue can send tool definitions and expect structured tool-call JSON in
     # the response. This particular model frequently emits tool-like markup as
@@ -340,6 +359,13 @@ def _postprocess_nonstreaming(body: bytes, log) -> bytes:
         msg = choice.get("message", {})
         for field in ("content", "reasoning"):
             val = msg.get(field)
+            # Strip leading tool-call-like fences that some models emit as plain text.
+            if isinstance(val, str) and val.lstrip().startswith("```tool"):
+                after = val.split("```", 2)
+                if len(after) == 3:
+                    msg[field] = after[2].lstrip()
+                    val = msg[field]
+                    changed = True
             if val and isinstance(val, str) and len(val) > 200:
                 truncated = _truncate_at_degeneration(val)
                 if len(truncated) < len(val):
