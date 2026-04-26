@@ -223,9 +223,10 @@ def _pump_backend_to_client(handler, resp: http.client.HTTPResponse, is_stream: 
             pass
 
 
-_MLX_MAX_COMPLETION_TOKENS = int(os.environ.get("MLX_MAX_COMPLETION_TOKENS", "2048"))
+_MLX_MAX_COMPLETION_TOKENS = int(os.environ.get("MLX_MAX_COMPLETION_TOKENS", "512"))
 _MLX_REP_PENALTY = float(os.environ.get("MLX_REPETITION_PENALTY", "2.0"))
 _MLX_REP_CONTEXT = int(os.environ.get("MLX_REPETITION_CONTEXT_SIZE", "1024"))
+_MLX_FORCE_NONSTREAM = os.environ.get("MLX_FORCE_NONSTREAM", "1") != "0"
 
 
 def _inject_generation_defaults(data: dict) -> None:
@@ -240,6 +241,11 @@ def _inject_generation_defaults(data: dict) -> None:
         cur = data.get("max_tokens") or data.get("max_completion_tokens") or 999999
         cap = min(int(cur), _MLX_MAX_COMPLETION_TOKENS)
         data["max_tokens"] = cap
+    if _MLX_FORCE_NONSTREAM:
+        # Continue often uses streaming; force non-streaming so we can reliably
+        # post-process and truncate degenerate outputs before they reach the client.
+        data["stream"] = False
+        data.pop("stream_options", None)
 
 
 def _rewrite_openai_model_field(body: bytes, backend_path: str, log) -> bytes:
