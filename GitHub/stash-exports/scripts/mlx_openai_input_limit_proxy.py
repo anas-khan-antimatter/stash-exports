@@ -260,6 +260,7 @@ _MLX_MAX_COMPLETION_TOKENS = int(os.environ.get("MLX_MAX_COMPLETION_TOKENS", "51
 _MLX_REP_PENALTY = float(os.environ.get("MLX_REPETITION_PENALTY", "2.0"))
 _MLX_REP_CONTEXT = int(os.environ.get("MLX_REPETITION_CONTEXT_SIZE", "1024"))
 _MLX_FORCE_NONSTREAM = os.environ.get("MLX_FORCE_NONSTREAM", "0") != "0"
+_BACKEND_TIMEOUT = float(os.environ.get("MLX_BACKEND_TIMEOUT", "600"))
 _MLX_SYSTEM_PREFIX = os.environ.get(
     "MLX_SYSTEM_PREFIX",
     "Do not output tool-call markup. Do not write lines starting with `tool` or fenced blocks like ```tool. "
@@ -519,6 +520,7 @@ class ProxyHandler(BaseHTTPRequestHandler):
             )
             self.log_message("rejecting request: %s", msg.replace("\n", " "))
             return False, _error_payload(msg)
+        self.log_message("accepting request: %d prompt tokens (max %d)", n, max_t)
         return True, None
 
     def _forward(self) -> None:
@@ -552,17 +554,8 @@ class ProxyHandler(BaseHTTPRequestHandler):
             except (json.JSONDecodeError, UnicodeDecodeError):
                 client_stream = False
             body = _rewrite_openai_model_field(body, backend_path, self.log_message)
-            # If the client requested SSE, force backend non-streaming so we can
-            # truncate/clean the full response and then re-emit SSE ourselves.
-            if client_stream:
-                try:
-                    req_data = json.loads(body.decode("utf-8"))
-                    if isinstance(req_data, dict):
-                        req_data["stream"] = False
-                        req_data.pop("stream_options", None)
-                        body = json.dumps(req_data, ensure_ascii=False).encode("utf-8")
-                except (json.JSONDecodeError, UnicodeDecodeError):
-                    pass
+            # Keep client streaming passthrough — buffering the full response before
+            # emitting SSE makes Continue look hung for minutes on large prompts.
 
         if body is not None and self._should_check(backend_path):
             ok, err_body = self._check_body(backend_path, body)
@@ -608,7 +601,7 @@ class ProxyHandler(BaseHTTPRequestHandler):
         if body is not None and self.command in ("POST", "PUT", "PATCH"):
             out_headers["Content-Length"] = str(len(body))
 
-        conn = http.client.HTTPConnection(backend_host, backend_port, timeout=None)
+        conn = http.client.HTTPConnection(backend_host, backend_port, timeout=_BACKEND_TIMEOUT)
         try:
             try:
                 conn.request(self.command, backend_path, body=body, headers=out_headers)
@@ -656,13 +649,41 @@ class ProxyHandler(BaseHTTPRequestHandler):
                 except (BrokenPipeError, ConnectionResetError):
                     pass
                 return
+            except TimeoutError as e:
+                self.log_message("backend timeout after %ss: %s", _BACKEND_TIMEOUT, e)
+                err = _error_payload(
+                    f"MLX backend timed out after {_BACKEND_TIMEOUT:.0f}s. "
+                    "Large prompts can take minutes to prefill — use Compact conversation, "
+                    "fewer @-files, or raise MLX_BACKEND_TIMEOUT.",
+                    code="mlx_backend_timeout",
+                )
+                self.send_response(504)
+                self.send_header("Content-Type", "application/json")
+                self.send_header("Content-Length", str(len(err)))
+                self.end_headers()
+                try:
+                    self.wfile.write(err)
+                except (BrokenPipeError, ConnectionResetError):
+                    pass
+                return
+            if client_stream and backend_path in (
+                "/v1/chat/completions",
+                "/v1/completions",
+                "/chat/completions",
+            ):
+                self.send_response(resp.status)
+                for hk, hv in resp.getheaders():
+                    if hk.lower() in ("transfer-encoding", "connection"):
+                        continue
+                    self.send_header(hk, hv)
+                self.end_headers()
+                _pump_backend_to_client(self, resp, is_stream=True)
+                return
+
             if backend_path in ("/v1/chat/completions", "/v1/completions", "/chat/completions"):
                 raw_body = resp.read()
                 resp.close()
                 cleaned = _postprocess_nonstreaming(raw_body, self.log_message)
-                if client_stream and backend_path in ("/v1/chat/completions", "/chat/completions"):
-                    _emit_sse_from_json(self, cleaned)
-                    return
                 resp_headers: Dict[str, str] = {}
                 for hk, hv in resp.getheaders():
                     if hk.lower() in ("transfer-encoding", "connection", "content-length"):

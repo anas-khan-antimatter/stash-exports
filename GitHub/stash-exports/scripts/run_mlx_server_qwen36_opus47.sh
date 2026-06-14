@@ -35,7 +35,8 @@ if [ "${MLX_ALLOW_LARGE_PREFILL_STEPS:-0}" != "1" ] && [ "$PREFILL" -gt "$PREFIL
   echo "warning: MLX_PREFILL_STEP_SIZE=$PREFILL exceeds cap $PREFILL_MAX for Qwen3.5 MoE A3B 5-bit. Using $PREFILL_MAX. Set MLX_ALLOW_LARGE_PREFILL_STEPS=1 to force." >&2
   PREFILL="$PREFILL_MAX"
 fi
-MAX_IN="${MLX_MAX_INPUT_TOKENS:-32768}"
+# Large prompts (10k+ tokens) can prefill for many minutes and look like a hang in Continue.
+MAX_IN="${MLX_MAX_INPUT_TOKENS:-8192}"
 # LRU KV prompt cache — 5-bit weights leave plenty of unified memory on 128GB Macs.
 CACHE_BYTES="${MLX_PROMPT_CACHE_BYTES:-16GB}"
 
